@@ -4,3 +4,6 @@ __pycache__/
 outputs/
 checkpoints/
 data/*
+.DS_Store
+*.zip
+notes.md
