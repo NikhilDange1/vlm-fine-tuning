@@ -24,28 +24,23 @@ Expected keys:
 For grounding data the response should look like
 
 ```json
-{"image": "...", 
+{"image": "images/example1.jpg", 
 "prompt": "...", 
 "response": "[{\"class\": \"class_name\", \"bbox\": [x1, y1, x2, y2]}, {\"class\": \"class_name\", \"bbox\": [x1,y1,x2,y2]}]}"}
 ```
 
 ## 3) Run training
 
+Using config file:
+
 ```bash
-python -m scripts.train_qlora_vlm \
-  --model-id Qwen/Qwen2.5-VL-3B-Instruct \
-  --train-data data/sample_train.jsonl \
-  --image-root . \
-  --output-dir outputs/qwen2_5_vl_qlora \
-  --max-steps 200 \
-  --batch-size 1 \
-  --gradient-accumulation-steps 8
+python scripts/train_qlora_vlm \
+  --config configs/train.example.yaml
 ```
-
-Run with grounding evaluation after training:
+Using CLI:
 
 ```bash
-python -m scripts.train_qlora_vlm \
+python scripts/train_qlora_vlm \
   --model-id Qwen/Qwen2.5-VL-3B-Instruct \
   --train-data data/train.jsonl \
   --eval-data data/val.jsonl \
@@ -55,6 +50,19 @@ python -m scripts.train_qlora_vlm \
   --eval-iou-threshold 0.5 \
   --eval-max-new-tokens 256
 ```
+CLI args override YAML
+
+Training outputs:
+- `resolved_config.json`
+- `train.log`
+- `eval_history.jsonl` (when `eval_data` is set)
+- TensorBoard logs under `<output_dir>/tb` (or custom `--tensorboard-dir`)
+
+Run TensorBoard:
+
+```bash
+tensorboard --logdir outputs/qwen2_5_vl_qlora/tb
+```
 
 ## Generate JSON labels from YOLO
 
@@ -63,7 +71,7 @@ Use `scripts/generate_labels_from_yolo.py` to convert a YOLO dataset (`images/` 
 Grounding response (class + bbox `x1,y1,x2,y2`):
 
 ```bash
-python -m scripts.generate_labels_from_yolo.py \
+python scripts/generate_labels_from_yolo.py \
   --yolo-data-dir /path/to/yolo_data \
   --prompt-file /path/to/prompt.txt \
   --grounding \
@@ -74,7 +82,7 @@ python -m scripts.generate_labels_from_yolo.py \
 Class list response (unique classes per image):
 
 ```bash
-python -m scripts.generate_labels_from_yolo.py \
+python scripts/generate_labels_from_yolo.py \
   --yolo-data-dir /path/to/yolo_data \
   --prompt-file /path/to/base_prompt.txt \
   --class-names "person,car,dog" \
