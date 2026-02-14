@@ -227,14 +227,21 @@ def evaluate_model_on_dataset(
     image_root: str,
     iou_threshold: float = 0.5,
     max_new_tokens: int = 256,
+    logger: Any = None,
+    progress_every: int = 10,
+    max_samples: int = 0,
 ) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]]]:
     device = getattr(model, "device", None)
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    rows = eval_rows[:max_samples] if max_samples and max_samples > 0 else eval_rows
+    total = len(rows)
     pred_rows: list[dict[str, Any]] = []
     model.eval()
-    for row in eval_rows:
+    if logger:
+        logger.info("Starting grounding generation eval for %d samples", total)
+    for idx, row in enumerate(rows, start=1):
         image_path = _resolve_image_path(str(row["image"]), image_root=image_root)
         prompt = str(row.get("prompt", ""))
         prompt_text = _build_user_prompt(processor, prompt)
@@ -267,9 +274,11 @@ def evaluate_model_on_dataset(
                 "response": response_text,
             }
         )
+        if logger and (idx == 1 or idx % max(1, progress_every) == 0 or idx == total):
+            logger.info("Grounding eval progress: %d/%d", idx, total)
 
     metrics, per_image = evaluate_records(
-        gt_rows=eval_rows,
+        gt_rows=rows,
         pred_rows=pred_rows,
         iou_threshold=iou_threshold,
     )

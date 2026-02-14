@@ -48,8 +48,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--eval-every-steps", type=int, default=None)
     parser.add_argument("--eval-subset-size", type=int, default=None)
+    parser.add_argument("--final-eval-subset-size", type=int, default=None)
+    parser.add_argument("--eval-progress-every", type=int, default=None)
     parser.add_argument("--eval-iou-threshold", type=float, default=None)
     parser.add_argument("--eval-max-new-tokens", type=int, default=None)
+    parser.add_argument("--skip-final-eval", action="store_true")
 
     parser.add_argument("--log-level", type=str, default=None)
     parser.add_argument("--log-file", type=str, default=None)
@@ -95,8 +98,11 @@ def _default_config() -> dict[str, Any]:
         "evaluation": {
             "eval_every_steps": 50,
             "eval_subset_size": 0,
+            "final_eval_subset_size": 0,
+            "eval_progress_every": 10,
             "eval_iou_threshold": 0.5,
             "eval_max_new_tokens": 256,
+            "run_final_eval": True,
         },
         "logging": {
             "log_level": "INFO",
@@ -150,6 +156,8 @@ def _apply_cli_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         "lora_dropout": ("model", "lora_dropout"),
         "eval_every_steps": ("evaluation", "eval_every_steps"),
         "eval_subset_size": ("evaluation", "eval_subset_size"),
+        "final_eval_subset_size": ("evaluation", "final_eval_subset_size"),
+        "eval_progress_every": ("evaluation", "eval_progress_every"),
         "eval_iou_threshold": ("evaluation", "eval_iou_threshold"),
         "eval_max_new_tokens": ("evaluation", "eval_max_new_tokens"),
         "log_level": ("logging", "log_level"),
@@ -165,6 +173,8 @@ def _apply_cli_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
 
     if args.eval_limit is not None and args.eval_subset_size is None:
         _set_path(cfg, ("evaluation", "eval_subset_size"), args.eval_limit)
+    if args.skip_final_eval:
+        _set_path(cfg, ("evaluation", "run_final_eval"), False)
 
 
 def _finalize_config(raw_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -185,6 +195,12 @@ def _finalize_config(raw_cfg: dict[str, Any]) -> dict[str, Any]:
     eval_every = int(cfg["evaluation"]["eval_every_steps"])
     if cfg["data"].get("eval_data") and eval_every < 1:
         raise ValueError("evaluation.eval_every_steps must be >=1 when eval_data is set.")
+    if int(cfg["evaluation"]["eval_progress_every"]) < 1:
+        raise ValueError("evaluation.eval_progress_every must be >=1.")
+    if int(cfg["evaluation"]["eval_subset_size"]) < 0:
+        raise ValueError("evaluation.eval_subset_size must be >=0.")
+    if int(cfg["evaluation"]["final_eval_subset_size"]) < 0:
+        raise ValueError("evaluation.final_eval_subset_size must be >=0.")
 
     return cfg
 
@@ -283,6 +299,7 @@ class PeriodicGroundingEvalCallback(TrainerCallback):
         eval_every_steps: int,
         eval_iou_threshold: float,
         eval_max_new_tokens: int,
+        eval_progress_every: int,
         logger: logging.Logger,
     ) -> None:
         self.trainer = trainer
@@ -294,6 +311,7 @@ class PeriodicGroundingEvalCallback(TrainerCallback):
         self.eval_every_steps = eval_every_steps
         self.eval_iou_threshold = eval_iou_threshold
         self.eval_max_new_tokens = eval_max_new_tokens
+        self.eval_progress_every = eval_progress_every
         self.logger = logger
         self.history_path = Path(output_dir) / "eval_history.jsonl"
         self._running = False
@@ -334,6 +352,8 @@ class PeriodicGroundingEvalCallback(TrainerCallback):
                 image_root=self.image_root,
                 iou_threshold=self.eval_iou_threshold,
                 max_new_tokens=self.eval_max_new_tokens,
+                logger=self.logger,
+                progress_every=self.eval_progress_every,
             )
 
             log_payload = {
@@ -528,6 +548,7 @@ def main() -> None:
             eval_every_steps=int(cfg["evaluation"]["eval_every_steps"]),
             eval_iou_threshold=float(cfg["evaluation"]["eval_iou_threshold"]),
             eval_max_new_tokens=int(cfg["evaluation"]["eval_max_new_tokens"]),
+            eval_progress_every=int(cfg["evaluation"]["eval_progress_every"]),
             logger=LOGGER,
         )
         trainer.add_callback(callback)
@@ -539,15 +560,27 @@ def main() -> None:
     model.save_pretrained(output_dir)
     processor.save_pretrained(output_dir)
 
-    if eval_ds is not None and eval_rows_all:
-        LOGGER.info("Running final full grounding evaluation.")
+    if eval_ds is not None and eval_rows_all and bool(cfg["evaluation"]["run_final_eval"]):
+        final_subset_size = int(cfg["evaluation"]["final_eval_subset_size"])
+        if final_subset_size > 0:
+            final_rows = eval_rows_all[: min(final_subset_size, len(eval_rows_all))]
+            LOGGER.info(
+                "Running final grounding evaluation on subset size=%d (of %d).",
+                len(final_rows),
+                len(eval_rows_all),
+            )
+        else:
+            final_rows = eval_rows_all
+            LOGGER.info("Running final full grounding evaluation on %d samples.", len(final_rows))
         metrics, per_image, pred_rows = evaluate_model_on_dataset(
             model=model,
             processor=processor,
-            eval_rows=eval_rows_all,
+            eval_rows=final_rows,
             image_root=image_root,
             iou_threshold=float(cfg["evaluation"]["eval_iou_threshold"]),
             max_new_tokens=int(cfg["evaluation"]["eval_max_new_tokens"]),
+            logger=LOGGER,
+            progress_every=int(cfg["evaluation"]["eval_progress_every"]),
         )
         metrics_path = Path(output_dir) / "eval_metrics.json"
         per_image_path = Path(output_dir) / "eval_per_image.jsonl"
@@ -559,6 +592,8 @@ def main() -> None:
 
         LOGGER.info("Final grounding eval metrics: %s", json.dumps(metrics))
         LOGGER.info("Wrote eval outputs: %s, %s, %s", metrics_path, per_image_path, pred_path)
+    elif eval_ds is not None and eval_rows_all:
+        LOGGER.info("Skipping final grounding evaluation (--skip-final-eval enabled).")
 
 
 if __name__ == "__main__":

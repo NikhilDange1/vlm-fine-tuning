@@ -30,11 +30,13 @@ training:
 evaluation:
   eval_every_steps: 50
   eval_subset_size: 0
+  final_eval_subset_size: 0
+  eval_progress_every: 10
   eval_iou_threshold: 0.5
   eval_max_new_tokens: 256
+  run_final_eval: true
 
 logging:
   log_level: "INFO"
   log_file: null
   tensorboard_dir: null
-
