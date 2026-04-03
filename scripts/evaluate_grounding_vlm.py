@@ -226,7 +226,7 @@ def evaluate_model_on_dataset(
     eval_rows: list[dict[str, Any]],
     image_root: str,
     iou_threshold: float = 0.5,
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 512,
     logger: Any = None,
     progress_every: int = 10,
     max_samples: int = 0,

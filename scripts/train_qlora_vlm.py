@@ -101,7 +101,7 @@ def _default_config() -> dict[str, Any]:
             "final_eval_subset_size": 0,
             "eval_progress_every": 10,
             "eval_iou_threshold": 0.5,
-            "eval_max_new_tokens": 256,
+            "eval_max_new_tokens": 512,
             "run_final_eval": True,
         },
         "logging": {
@@ -483,6 +483,17 @@ def main() -> None:
     model.config.use_cache = False
     model.print_trainable_parameters()
 
+    # Pre-compute the token ids for the assistant turn start marker so we can
+    # mask the prompt from the training loss (only supervise the response).
+    # Qwen chat template uses "<|im_start|>assistant\n"; other processors may
+    # differ, so we try a few common patterns and fall back gracefully.
+    _assistant_marker_ids: list[int] | None = None
+    for _marker in ["<|im_start|>assistant\n", "<|im_start|>assistant", "assistant"]:
+        _ids = tokenizer.encode(_marker, add_special_tokens=False)
+        if _ids:
+            _assistant_marker_ids = _ids
+            break
+
     def collate_fn(rows: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         images = []
         texts = []
@@ -498,7 +509,24 @@ def main() -> None:
             padding=True,
         )
         labels = batch["input_ids"].clone()
+        # Mask padding tokens.
         labels[labels == tokenizer.pad_token_id] = -100
+
+        # Mask prompt tokens so the loss is computed only on the assistant
+        # response.  We locate the last occurrence of the assistant turn start
+        # marker and mask everything up to (and including) it.
+        if _assistant_marker_ids:
+            marker_len = len(_assistant_marker_ids)
+            for i, seq in enumerate(batch["input_ids"].tolist()):
+                # Search from the end so we find the last (assistant) turn.
+                found_at = -1
+                for j in range(len(seq) - marker_len, -1, -1):
+                    if seq[j : j + marker_len] == _assistant_marker_ids:
+                        found_at = j
+                        break
+                if found_at >= 0:
+                    labels[i, : found_at + marker_len] = -100
+
         batch["labels"] = labels
         return batch
 

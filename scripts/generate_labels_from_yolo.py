@@ -54,6 +54,16 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional comma-separated class names by class id order.",
     )
+    parser.add_argument(
+        "--coord-space",
+        choices=["pixel", "norm1000"],
+        default="norm1000",
+        help=(
+            "Coordinate space for bounding boxes in the output JSONL. "
+            "'norm1000' (default) normalizes to [0, 1000] as expected by Qwen2.5-VL. "
+            "'pixel' outputs absolute pixel coordinates [x1, y1, x2, y2]."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -76,7 +86,12 @@ def parse_yolo_line(line: str) -> YoloObject:
     )
 
 
-def yolo_to_xyxy(obj: YoloObject, image_w: int, image_h: int) -> list[float]:
+def yolo_to_xyxy(
+    obj: YoloObject,
+    image_w: int,
+    image_h: int,
+    coord_space: str = "norm1000",
+) -> list[float]:
     x_center = obj.x_center * image_w
     y_center = obj.y_center * image_h
     box_w = obj.width * image_w
@@ -86,6 +101,16 @@ def yolo_to_xyxy(obj: YoloObject, image_w: int, image_h: int) -> list[float]:
     y1 = max(0.0, y_center - box_h / 2.0)
     x2 = min(float(image_w), x_center + box_w / 2.0)
     y2 = min(float(image_h), y_center + box_h / 2.0)
+
+    if coord_space == "norm1000":
+        # Qwen2.5-VL expects coordinates normalized to [0, 1000].
+        return [
+            round(x1 / image_w * 1000),
+            round(y1 / image_h * 1000),
+            round(x2 / image_w * 1000),
+            round(y2 / image_h * 1000),
+        ]
+    # pixel space
     return [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)]
 
 
@@ -137,7 +162,7 @@ def main() -> None:
             response_payload = [
                 {
                     "class": class_name_for(obj.class_id, class_names),
-                    "bbox": yolo_to_xyxy(obj, image_w=image_w, image_h=image_h),
+                    "bbox": yolo_to_xyxy(obj, image_w=image_w, image_h=image_h, coord_space=args.coord_space),
                 }
                 for obj in objects
             ]
