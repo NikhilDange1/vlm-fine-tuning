@@ -7,6 +7,8 @@ model:
   bnb_4bit_quant_type: "nf4"
   bnb_4bit_compute_dtype: "bfloat16"
   bnb_4bit_use_double_quant: true
+  input_width: 896
+  input_height: 896
 
 data:
   train_data: "data/sample_train.jsonl"

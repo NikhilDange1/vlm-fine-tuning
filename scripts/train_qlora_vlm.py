@@ -75,6 +75,8 @@ def _default_config() -> dict[str, Any]:
             "bnb_4bit_quant_type": "nf4",
             "bnb_4bit_compute_dtype": "bfloat16",
             "bnb_4bit_use_double_quant": True,
+            "input_width":896,
+            "input_height":896,
         },
         "data": {
             "train_data": None,
@@ -439,7 +441,9 @@ def main() -> None:
         LOGGER.info("Loaded eval dataset rows=%d from %s", len(eval_ds), eval_data)
 
     processor = AutoProcessor.from_pretrained(
-        str(cfg["model"]["model_id"]), trust_remote_code=True
+        str(cfg["model"]["model_id"]), trust_remote_code=True,
+        min_pixels = cfg["model"]["input_width"] * cfg["model"]["input_height"],
+        max_pixel = cfg["model"]["input_width"] * cfg["model"]["input_height"]
     )
     tokenizer = processor.tokenizer
     if tokenizer.pad_token_id is None:

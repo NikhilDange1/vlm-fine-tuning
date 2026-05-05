@@ -83,6 +83,7 @@ def main() -> None:
     parser.add_argument("--num-samples", type=int, default=5, help="Number of samples to inspect.")
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Max tokens for generation.")
     parser.add_argument("--iou-threshold", type=float, default=0.5, help="IoU threshold for matching.")
+    parser.add_argument("--img-size",type=int,default=896,help="Input images size")
     args = parser.parse_args()
 
     print(SEP)
@@ -91,7 +92,8 @@ def main() -> None:
 
     # Load processor and model
     print(f"\nLoading processor from: {args.model_dir}")
-    processor = AutoProcessor.from_pretrained(str(args.model_dir), trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(str(args.model_dir), trust_remote_code=True,
+                                              min_pixels = int(args.img_size)**2)
     print(f"Loading model from: {args.model_dir}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AutoModelForImageTextToText.from_pretrained(
