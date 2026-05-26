@@ -372,33 +372,76 @@ def _load_model_and_processor(
     return model, processor
 
 
-def _run_inference(
+def _decode(processor: Any, token_ids: torch.Tensor) -> str:
+    if hasattr(processor, "decode"):
+        return processor.decode(token_ids, skip_special_tokens=True).strip()
+    return processor.tokenizer.decode(token_ids, skip_special_tokens=True).strip()
+
+
+def _actual_token_count(generated_ids: torch.Tensor, eos_id: int | None) -> int:
+    """Count real generated tokens, stopping at the first EOS.
+
+    In a padded batch all sequences are the same length; those that finished
+    early are padded with pad tokens after EOS.  Counting only up to (and
+    including) the first EOS gives the correct per-sample token budget used,
+    which drives the TRUNCATED format-error check.
+    """
+    if eos_id is not None:
+        eos_pos = (generated_ids == eos_id).nonzero(as_tuple=True)[0]
+        if len(eos_pos):
+            return int(eos_pos[0].item()) + 1
+    return int(generated_ids.shape[0])
+
+
+def _run_inference_batch(
     model: Any,
     processor: Any,
-    image: Image.Image,
-    prompt_text: str,
+    images: list[Image.Image],
+    prompt_texts: list[str],
     max_new_tokens: int,
     device: torch.device,
-) -> tuple[str, int]:
-    """Return (decoded_response_text, number_of_generated_tokens)."""
-    inputs = processor(images=image, text=prompt_text, return_tensors="pt")
+) -> list[tuple[str, int]]:
+    """Run one batched forward + generate pass.
+
+    Returns a list of (decoded_text, output_token_count) in the same order
+    as *images* / *prompt_texts*.
+
+    Design notes
+    ------------
+    * ``padding_side`` must be ``"left"`` on the tokenizer (set in
+      ``_load_model_and_processor``) so padding tokens precede — not follow —
+      the real prompt.  Right-padding corrupts causal attention for all but
+      the longest item in the batch.
+    * All items in a batch share the same padded input length, so
+      ``output_ids[i, padded_input_len:]`` gives each sample's generated
+      tokens cleanly.
+    * Generation stops when **every** sequence has produced EOS or hit
+      ``max_new_tokens``.  One very long output stalls the whole batch.
+      Keep batch sizes modest (4–8) for datasets with variable output length.
+    """
+    inputs = processor(
+        images=images,
+        text=prompt_texts,
+        return_tensors="pt",
+        padding=True,
+    )
     for key, val in list(inputs.items()):
         if hasattr(val, "to"):
             inputs[key] = val.to(device)
 
+    padded_input_len = int(inputs["input_ids"].shape[-1])
+    eos_id: int | None = processor.tokenizer.eos_token_id
+
     with torch.no_grad():
         output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
 
-    input_len = int(inputs["input_ids"].shape[-1])
-    generated_ids = output_ids[0][input_len:]
-    output_tokens = len(generated_ids)
-
-    if hasattr(processor, "decode"):
-        text = processor.decode(generated_ids, skip_special_tokens=True).strip()
-    else:
-        text = processor.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-
-    return text, output_tokens
+    results: list[tuple[str, int]] = []
+    for i in range(len(images)):
+        generated_ids = output_ids[i, padded_input_len:]
+        n_tokens = _actual_token_count(generated_ids, eos_id)
+        text = _decode(processor, generated_ids[:n_tokens])
+        results.append((text, n_tokens))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -470,87 +513,125 @@ def validate(
     max_new_tokens: int,
     coord_space: str,
     device: torch.device,
+    batch_size: int = 1,
 ) -> list[SampleResult]:
+    """Run inference and scoring over *rows*, processing *batch_size* samples per
+    ``model.generate()`` call.
+
+    batch_size=1  — identical behaviour to the original sequential loop.
+    batch_size>1  — images and prompts are stacked into a single forward pass,
+                    giving better GPU utilisation.  Peak VRAM scales with
+                    batch size; start with 4 and double until OOM.
+    """
     results: list[SampleResult] = []
     total = len(rows)
+    n_batches = (total + batch_size - 1) // batch_size
 
-    for idx, row in enumerate(rows, start=1):
-        image_key = str(row.get("image", ""))
-        image_path = _resolve_image_path(image_key, image_root=image_root)
-        prompt = str(row.get("prompt", row.get("question", row.get("instruction", ""))))
-        gt_response = str(row.get("response", row.get("answer", row.get("output", ""))))
+    for batch_idx in range(n_batches):
+        batch_rows = rows[batch_idx * batch_size : (batch_idx + 1) * batch_size]
 
-        # -- Inference --------------------------------------------------
-        t0 = time.time()
-        try:
-            with Image.open(image_path) as img:
+        # -- Load images & build prompts (collect failures immediately) ----
+        valid_items: list[tuple[str, str, str, Image.Image, int, int]] = []
+        # (image_key, prompt, gt_response, rgb_image, img_w, img_h)
+
+        for row in batch_rows:
+            image_key = str(row.get("image", ""))
+            image_path = _resolve_image_path(image_key, image_root=image_root)
+            prompt = str(row.get("prompt", row.get("question", row.get("instruction", ""))))
+            gt_response = str(row.get("response", row.get("answer", row.get("output", ""))))
+            try:
+                img = Image.open(image_path)
                 img_w, img_h = img.size
                 rgb = img.convert("RGB")
-                prompt_text = _build_user_prompt(processor, prompt)
-                pred_text, output_tokens = _run_inference(
-                    model, processor, rgb, prompt_text, max_new_tokens, device
-                )
-        except Exception as exc:
-            LOGGER.error("[%d/%d] Inference failed for %s: %s", idx, total, image_path, exc)
-            results.append(SampleResult(
-                image=image_key, prompt=prompt,
-                gt_response=gt_response, pred_response="",
-                gt_objects=[], pred_objects=[],
-                tp=0, fp=0, fn=len(parse_grounding_response(gt_response)),
-                match_iou_mean=0.0, output_tokens=0,
-                max_new_tokens=max_new_tokens,
-                format_errors=[FormatError(
-                    "INFERENCE_ERROR",
-                    f"Exception during inference: {exc}",
-                    "",
-                )],
-            ))
+                img.close()
+                valid_items.append((image_key, prompt, gt_response, rgb, img_w, img_h))
+            except Exception as exc:
+                LOGGER.error("Failed to open image %s: %s", image_path, exc)
+                results.append(SampleResult(
+                    image=image_key, prompt=prompt,
+                    gt_response=gt_response, pred_response="",
+                    gt_objects=[], pred_objects=[],
+                    tp=0, fp=0, fn=len(parse_grounding_response(gt_response)),
+                    match_iou_mean=0.0, output_tokens=0,
+                    max_new_tokens=max_new_tokens,
+                    format_errors=[FormatError(
+                        "INFERENCE_ERROR",
+                        f"Could not open image: {exc}", "",
+                    )],
+                ))
+
+        if not valid_items:
             continue
 
-        elapsed = time.time() - t0
+        # -- Batched inference -------------------------------------------
+        batch_images   = [it[3] for it in valid_items]
+        batch_prompts  = [_build_user_prompt(processor, it[1]) for it in valid_items]
 
-        # -- Format error detection ------------------------------------
-        fmt_errors = detect_format_errors(
-            raw=pred_text,
-            output_tokens=output_tokens,
-            max_new_tokens=max_new_tokens,
-            coord_space=coord_space,
-            img_w=img_w,
-            img_h=img_h,
-        )
+        t0 = time.time()
+        try:
+            batch_outputs = _run_inference_batch(
+                model, processor, batch_images, batch_prompts, max_new_tokens, device,
+            )
+        except Exception as exc:
+            LOGGER.error(
+                "Batch %d/%d inference failed (%s). Falling back to per-sample.",
+                batch_idx + 1, n_batches, exc,
+            )
+            # Fall back to single-sample so one bad image doesn't lose the batch.
+            batch_outputs = []
+            for img_tensor, prompt_text in zip(batch_images, batch_prompts):
+                try:
+                    out = _run_inference_batch(
+                        model, processor, [img_tensor], [prompt_text], max_new_tokens, device,
+                    )
+                    batch_outputs.append(out[0])
+                except Exception as exc2:
+                    LOGGER.error("  Per-sample fallback also failed: %s", exc2)
+                    batch_outputs.append(("", 0))
 
-        # -- Scoring ---------------------------------------------------
-        gt_objects = parse_grounding_response(gt_response)
-        pred_objects = parse_grounding_response(pred_text)
-        tp, fp, fn, iou_mean = _score(gt_objects, pred_objects, iou_threshold)
+        elapsed_batch = time.time() - t0
+        elapsed_per   = elapsed_batch / len(valid_items)
 
-        results.append(SampleResult(
-            image=image_key,
-            prompt=prompt,
-            gt_response=gt_response,
-            pred_response=pred_text,
-            gt_objects=gt_objects,
-            pred_objects=pred_objects,
-            tp=tp, fp=fp, fn=fn,
-            match_iou_mean=iou_mean,
-            output_tokens=output_tokens,
-            max_new_tokens=max_new_tokens,
-            format_errors=fmt_errors,
-        ))
+        # -- Per-sample scoring & logging ---------------------------------
+        done_so_far = batch_idx * batch_size
+        for i, (image_key, prompt, gt_response, _rgb, img_w, img_h) in enumerate(valid_items):
+            sample_num = done_so_far + i + 1
+            pred_text, output_tokens = batch_outputs[i]
 
-        # -- Progress --------------------------------------------------
-        n_errs = len(fmt_errors)
-        prec = tp / (tp + fp) if (tp + fp) else 0.0
-        rec  = tp / (tp + fn) if (tp + fn) else 0.0
-        LOGGER.info(
-            "[%d/%d] %s  gt=%d pred=%d tp=%d fp=%d fn=%d  P=%.3f R=%.3f  "
-            "fmt_errors=%d  tokens=%d/%d  %.1fs",
-            idx, total, image_key,
-            len(gt_objects), len(pred_objects),
-            tp, fp, fn, prec, rec,
-            n_errs, output_tokens, max_new_tokens, elapsed,
-        )
-        if fmt_errors:
+            fmt_errors = detect_format_errors(
+                raw=pred_text,
+                output_tokens=output_tokens,
+                max_new_tokens=max_new_tokens,
+                coord_space=coord_space,
+                img_w=img_w,
+                img_h=img_h,
+            )
+
+            gt_objects   = parse_grounding_response(gt_response)
+            pred_objects = parse_grounding_response(pred_text)
+            tp, fp, fn, iou_mean = _score(gt_objects, pred_objects, iou_threshold)
+
+            results.append(SampleResult(
+                image=image_key, prompt=prompt,
+                gt_response=gt_response, pred_response=pred_text,
+                gt_objects=gt_objects, pred_objects=pred_objects,
+                tp=tp, fp=fp, fn=fn,
+                match_iou_mean=iou_mean,
+                output_tokens=output_tokens,
+                max_new_tokens=max_new_tokens,
+                format_errors=fmt_errors,
+            ))
+
+            prec = tp / (tp + fp) if (tp + fp) else 0.0
+            rec  = tp / (tp + fn) if (tp + fn) else 0.0
+            LOGGER.info(
+                "[%d/%d] %s  gt=%d pred=%d tp=%d fp=%d fn=%d  "
+                "P=%.3f R=%.3f  fmt_errors=%d  tokens=%d/%d  %.1fs/sample",
+                sample_num, total, image_key,
+                len(gt_objects), len(pred_objects),
+                tp, fp, fn, prec, rec,
+                len(fmt_errors), output_tokens, max_new_tokens, elapsed_per,
+            )
             for e in fmt_errors:
                 LOGGER.warning("  [%s] %s", e.code, e.message)
 
@@ -685,6 +766,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of images to process per model.generate() call. "
+            "batch_size=1 is safest and identical to the original behaviour. "
+            "Increase (e.g. 4 or 8) to improve GPU utilisation at the cost of "
+            "higher peak VRAM. Generation stops when every sample in the batch "
+            "has hit EOS or max-new-tokens, so very long outlier outputs can "
+            "stall a batch — keep sizes modest for variable-length datasets."
+        ),
+    )
+    parser.add_argument(
         "--no-quantize",
         action="store_true",
         help="Load model in full precision (bfloat16) instead of 4-bit NF4.",
@@ -737,6 +831,7 @@ def main() -> None:
     LOGGER.info("max-new-tokens : %s", args.max_new_tokens)
     LOGGER.info("coord-space    : %s", args.coord_space)
     LOGGER.info("img-size       : %s", args.img_size or "(processor default)")
+    LOGGER.info("batch-size     : %d", args.batch_size)
     LOGGER.info("quantize       : %s", not args.no_quantize)
 
     # Save run config for reproducibility
@@ -775,6 +870,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         coord_space=args.coord_space,
         device=device,
+        batch_size=args.batch_size,
     )
     elapsed_total = time.time() - t_start
     LOGGER.info("Inference complete in %.1f s (%.2f s/sample).", elapsed_total, elapsed_total / max(len(results), 1))
