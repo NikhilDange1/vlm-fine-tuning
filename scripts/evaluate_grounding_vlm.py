@@ -12,6 +12,20 @@ from PIL import Image
 
 
 def parse_grounding_response(raw: Any) -> list[dict[str, Any]]:
+    """Parse a model grounding response into a list of {class, bbox} dicts.
+
+    Accepted formats
+    ----------------
+    Wrapped object (preferred, new format):
+        {"faults": [{"class": "open", "bbox": [x1, y1, x2, y2]}, ...]}
+        {"faults": []}
+
+    Legacy bare array (still accepted for backward compatibility):
+        [{"class": "open", "bbox": [x1, y1, x2, y2]}, ...]
+
+    The input may be a pre-parsed Python object or a raw JSON string
+    (possibly with surrounding prose that needs to be stripped first).
+    """
     if raw is None:
         return []
     parsed: Any = raw
@@ -22,18 +36,36 @@ def parse_grounding_response(raw: Any) -> list[dict[str, Any]]:
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
-            left = text.find("[")
-            right = text.rfind("]")
-            if left >= 0 and right > left:
+            # Try to salvage JSON from within surrounding prose.
+            # Prefer the wrapped-object form first, then fall back to bare array.
+            brace_l = text.find("{")
+            brace_r = text.rfind("}")
+            if brace_l >= 0 and brace_r > brace_l:
                 try:
-                    parsed = json.loads(text[left : right + 1])
+                    parsed = json.loads(text[brace_l : brace_r + 1])
                 except json.JSONDecodeError:
-                    return []
-            else:
-                return []
+                    pass
 
+            if isinstance(parsed, str):          # still unparsed — try bare array
+                left = text.find("[")
+                right = text.rfind("]")
+                if left >= 0 and right > left:
+                    try:
+                        parsed = json.loads(text[left : right + 1])
+                    except json.JSONDecodeError:
+                        return []
+                else:
+                    return []
+
+    # Unwrap the preferred {"faults": [...]} envelope.
     if isinstance(parsed, dict):
-        parsed = [parsed]
+        # Accept "faults" or any single key whose value is a list of objects.
+        if "faults" in parsed:
+            parsed = parsed["faults"]
+        else:
+            # Bare dict — treat as a single detection (legacy / bare-list compat).
+            parsed = [parsed]
+
     if not isinstance(parsed, list):
         return []
 

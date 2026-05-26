@@ -159,7 +159,7 @@ def main() -> None:
             image_w, image_h = img.size
 
         if args.grounding:
-            response_payload = [
+            faults = [
                 {
                     "class": class_name_for(obj.class_id, class_names),
                     "bbox": yolo_to_xyxy(obj, image_w=image_w, image_h=image_h, coord_space=args.coord_space),
@@ -169,7 +169,8 @@ def main() -> None:
             record = {
                 "image": str(image_path.relative_to(yolo_data_dir.parent)),
                 "prompt": prompt,
-                "response": json.dumps(response_payload, ensure_ascii=False),
+                # Wrapped format: {"faults": [...]} — empty list when no defects found.
+                "response": json.dumps({"faults": faults}, ensure_ascii=False),
             }
         else:
             seen: list[str] = []
