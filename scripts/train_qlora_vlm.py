@@ -58,6 +58,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-file", type=str, default=None)
     parser.add_argument("--tensorboard-dir", type=str, default=None)
 
+    parser.add_argument(
+        "--system-prompt-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a plain-text file whose content is prepended as a system "
+            "message in the chat template for every training sample.  Optional — "
+            "if omitted no system turn is added to the conversation."
+        ),
+    )
+
     # Backward-compatible alias from earlier script revisions.
     parser.add_argument("--eval-limit", type=int, default=None)
 
@@ -82,6 +93,7 @@ def _default_config() -> dict[str, Any]:
             "train_data": None,
             "eval_data": "",
             "image_root": "",
+            "system_prompt_file": None,
         },
         "training": {
             "output_dir": "outputs/checkpoint",
@@ -156,6 +168,7 @@ def _apply_cli_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         "lora_r": ("model", "lora_r"),
         "lora_alpha": ("model", "lora_alpha"),
         "lora_dropout": ("model", "lora_dropout"),
+        "system_prompt_file": ("data", "system_prompt_file"),
         "eval_every_steps": ("evaluation", "eval_every_steps"),
         "eval_subset_size": ("evaluation", "eval_subset_size"),
         "final_eval_subset_size": ("evaluation", "final_eval_subset_size"),
@@ -193,6 +206,10 @@ def _finalize_config(raw_cfg: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Missing required model.model_id (or --model-id).")
     if not cfg["data"].get("train_data"):
         raise ValueError("Missing required data.train_data (or --train-data).")
+
+    sp_file = cfg["data"].get("system_prompt_file")
+    if sp_file and not Path(sp_file).is_file():
+        raise ValueError(f"system_prompt_file not found: {sp_file}")
 
     eval_every = int(cfg["evaluation"]["eval_every_steps"])
     if cfg["data"].get("eval_data") and eval_every < 1:
@@ -253,9 +270,20 @@ def _to_batch_example(row: dict[str, Any], image_root: str) -> tuple[str, str, s
     )
 
 
-def _build_chat_text(processor: AutoProcessor, prompt: str, response: str) -> str:
+def _build_chat_text(
+    processor: AutoProcessor,
+    prompt: str,
+    response: str,
+    system_prompt: str | None = None,
+) -> str:
     if hasattr(processor, "apply_chat_template"):
-        messages = [
+        messages: list[dict[str, Any]] = []
+        if system_prompt:
+            messages.append({
+                "role": "system",
+                "content": [{"type": "text", "text": system_prompt}],
+            })
+        messages += [
             {
                 "role": "user",
                 "content": [
@@ -271,7 +299,9 @@ def _build_chat_text(processor: AutoProcessor, prompt: str, response: str) -> st
         return processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False
         )
-    return f"User: <image>\n{prompt}\nAssistant: {response}"
+    # Fallback for processors without apply_chat_template.
+    prefix = f"System: {system_prompt}\n" if system_prompt else ""
+    return f"{prefix}User: <image>\n{prompt}\nAssistant: {response}"
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
@@ -430,6 +460,17 @@ def main() -> None:
     eval_data = str(cfg["data"].get("eval_data") or "")
     image_root = str(cfg["data"].get("image_root") or "")
 
+    # Load optional system prompt from file. None means no system turn.
+    system_prompt: str | None = None
+    sp_file = cfg["data"].get("system_prompt_file")
+    if sp_file:
+        system_prompt = Path(sp_file).read_text(encoding="utf-8").strip()
+        if not system_prompt:
+            LOGGER.warning("system_prompt_file '%s' is empty — no system turn will be added.", sp_file)
+            system_prompt = None
+        else:
+            LOGGER.info("System prompt loaded from %s (%d chars): %s", sp_file, len(system_prompt), system_prompt[:120])
+
     train_ds = load_dataset("json", data_files=train_data, split="train")
     LOGGER.info("Loaded train dataset rows=%d from %s", len(train_ds), train_data)
 
@@ -504,7 +545,7 @@ def main() -> None:
         for row in rows:
             image_path, prompt, response = _to_batch_example(row, image_root=image_root)
             images.append(Image.open(image_path).convert("RGB"))
-            texts.append(_build_chat_text(processor, prompt, response))
+            texts.append(_build_chat_text(processor, prompt, response, system_prompt=system_prompt))
 
         batch = processor(
             images=images,
