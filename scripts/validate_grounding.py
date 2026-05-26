@@ -47,6 +47,7 @@ from typing import Any
 
 import torch
 from PIL import Image
+from peft import PeftModel
 from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -260,17 +261,82 @@ def detect_format_errors(
 # Inference helpers
 # ---------------------------------------------------------------------------
 
+def _is_peft_adapter(model_dir: str) -> bool:
+    """Return True when *model_dir* contains a PEFT / LoRA adapter save.
+
+    A PEFT adapter directory has ``adapter_config.json`` but does not contain
+    full model weight shards.  Both Trainer periodic checkpoints
+    (``checkpoint-N/``) and the final ``model.save_pretrained(output_dir)``
+    call in ``train_qlora_vlm.py`` produce this layout when training with LoRA.
+    """
+    return (Path(model_dir) / "adapter_config.json").exists()
+
+
+def _read_base_model_from_adapter(adapter_dir: str) -> str:
+    """Read ``base_model_name_or_path`` from ``adapter_config.json``."""
+    cfg_path = Path(adapter_dir) / "adapter_config.json"
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        base = data.get("base_model_name_or_path", "")
+        if base:
+            return base
+    except Exception:
+        pass
+    raise ValueError(
+        f"Cannot determine base model from {cfg_path}. "
+        "Pass --base-model-id explicitly."
+    )
+
+
 def _load_model_and_processor(
     model_dir: str,
     quantize: bool,
     device: torch.device,
+    img_size: int | None = None,
+    base_model_id: str | None = None,
 ) -> tuple[Any, Any]:
+    """Load processor + model, handling three checkpoint layouts automatically.
+
+    1. **Full HuggingFace model** (base model or merged fine-tune):
+       ``model_dir`` has ``config.json`` + weight shards.
+       Loaded directly with ``AutoModelForImageTextToText``.
+
+    2. **PEFT / LoRA adapter** — what ``train_qlora_vlm.py`` writes:
+       ``model_dir`` has ``adapter_config.json`` only (no full weights).
+       The base model ID is read from ``adapter_config.json`` automatically,
+       or overridden with ``--base-model-id``.
+       The root ``output_dir`` holds the *final* adapter (end of training).
+       Pass a specific ``checkpoint-N/`` subdirectory for a mid-run snapshot.
+
+    3. **Base model for baseline comparison**:
+       Pass a HuggingFace model ID (e.g. ``Qwen/Qwen2.5-VL-7B-Instruct``)
+       with no ``--base-model-id`` override — loaded as a full model.
+    """
+    # --- Processor --------------------------------------------------------
     LOGGER.info("Loading processor from: %s", model_dir)
-    processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
+    processor_kwargs: dict[str, Any] = {"trust_remote_code": True}
+    if img_size is not None:
+        processor_kwargs["min_pixels"] = img_size * img_size
+        processor_kwargs["max_pixels"] = img_size * img_size
+        LOGGER.info("Processor image resolution forced to %dx%d.", img_size, img_size)
+
+    # Processor files (tokenizer, image processor) are saved alongside the
+    # adapter by train_qlora_vlm.py (lines 592-593).  If they are missing
+    # (e.g. a bare Trainer checkpoint), fall back to the base model.
+    proc_source = model_dir
+    if _is_peft_adapter(model_dir) and not (Path(model_dir) / "tokenizer_config.json").exists():
+        proc_source = base_model_id or _read_base_model_from_adapter(model_dir)
+        LOGGER.info("Processor not in adapter dir — loading from base model: %s", proc_source)
+
+    processor = AutoProcessor.from_pretrained(proc_source, **processor_kwargs)
     if processor.tokenizer.pad_token_id is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
+    # Left-padding is required for correct batched causal-LM generation.
+    # Right-padding causes the model to attend to pad tokens before the prompt.
+    processor.tokenizer.padding_side = "left"
 
-    LOGGER.info("Loading model from: %s  (quantize=%s)", model_dir, quantize)
+    # --- Quantisation config ----------------------------------------------
+    quant_cfg: BitsAndBytesConfig | None = None
     if quantize:
         quant_cfg = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -278,20 +344,29 @@ def _load_model_and_processor(
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
         )
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_dir,
-            device_map="auto",
-            trust_remote_code=True,
-            quantization_config=quant_cfg,
-            torch_dtype=torch.bfloat16,
+
+    common_kwargs: dict[str, Any] = {
+        "device_map": "auto",
+        "trust_remote_code": True,
+        "torch_dtype": torch.bfloat16,
+    }
+    if quant_cfg is not None:
+        common_kwargs["quantization_config"] = quant_cfg
+
+    # --- Model ------------------------------------------------------------
+    if _is_peft_adapter(model_dir):
+        resolved_base = base_model_id or _read_base_model_from_adapter(model_dir)
+        LOGGER.info(
+            "PEFT adapter detected.  Loading base=%s then applying adapter=%s",
+            resolved_base, model_dir,
         )
+        base = AutoModelForImageTextToText.from_pretrained(resolved_base, **common_kwargs)
+        model = PeftModel.from_pretrained(base, model_dir)
+        LOGGER.info("LoRA adapter applied.")
     else:
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_dir,
-            device_map="auto",
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-        )
+        LOGGER.info("Loading full model from: %s  (quantize=%s)", model_dir, quantize)
+        model = AutoModelForImageTextToText.from_pretrained(model_dir, **common_kwargs)
+
     model.eval()
     LOGGER.info("Model ready.")
     return model, processor
@@ -588,6 +663,28 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--base-model-id",
+        type=str,
+        default=None,
+        help=(
+            "Base HuggingFace model ID used when --model-dir points at a PEFT "
+            "adapter checkpoint (which contains only LoRA delta weights, not the "
+            "full model).  If omitted the base model ID is read automatically "
+            "from adapter_config.json.  Not needed when --model-dir is a full "
+            "model or a HuggingFace model ID."
+        ),
+    )
+    parser.add_argument(
+        "--img-size",
+        type=int,
+        default=None,
+        help=(
+            "Fix the processor image resolution to img_size × img_size pixels. "
+            "Use 896 to match Qwen2.5-VL's patch grid (32 × 28px patches) when "
+            "training data uses norm1000 coordinates on non-1000px images."
+        ),
+    )
+    parser.add_argument(
         "--no-quantize",
         action="store_true",
         help="Load model in full precision (bfloat16) instead of 4-bit NF4.",
@@ -631,6 +728,7 @@ def main() -> None:
     LOGGER.info("VLM GROUNDING VALIDATION")
     LOGGER.info(SEP)
     LOGGER.info("model-dir      : %s", args.model_dir)
+    LOGGER.info("base-model-id  : %s", args.base_model_id or "(auto from adapter_config.json)")
     LOGGER.info("eval-data      : %s", args.eval_data)
     LOGGER.info("image-root     : %s", args.image_root or "(none)")
     LOGGER.info("output-dir     : %s", output_dir)
@@ -638,6 +736,7 @@ def main() -> None:
     LOGGER.info("iou-threshold  : %s", args.iou_threshold)
     LOGGER.info("max-new-tokens : %s", args.max_new_tokens)
     LOGGER.info("coord-space    : %s", args.coord_space)
+    LOGGER.info("img-size       : %s", args.img_size or "(processor default)")
     LOGGER.info("quantize       : %s", not args.no_quantize)
 
     # Save run config for reproducibility
@@ -659,6 +758,8 @@ def main() -> None:
         model_dir=args.model_dir,
         quantize=not args.no_quantize,
         device=device,
+        img_size=args.img_size,
+        base_model_id=args.base_model_id,
     )
 
     # Run validation
