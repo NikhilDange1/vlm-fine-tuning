@@ -235,21 +235,30 @@ def _resolve_image_path(path: str, image_root: str) -> str:
     return os.path.join(image_root, path)
 
 
-def _build_user_prompt(processor: Any, prompt: str) -> str:
+def _build_user_prompt(
+    processor: Any,
+    prompt: str,
+    system_prompt: str | None = None,
+) -> str:
     if hasattr(processor, "apply_chat_template"):
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
+        messages: list[dict] = []
+        if system_prompt:
+            messages.append({
+                "role": "system",
+                "content": [{"type": "text", "text": system_prompt}],
+            })
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": prompt},
+            ],
+        })
         return processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-    return f"User: <image>\n{prompt}\nAssistant:"
+    prefix = f"System: {system_prompt}\n" if system_prompt else ""
+    return f"{prefix}User: <image>\n{prompt}\nAssistant:"
 
 
 def evaluate_model_on_dataset(

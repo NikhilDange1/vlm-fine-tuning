@@ -514,6 +514,7 @@ def validate(
     coord_space: str,
     device: torch.device,
     batch_size: int = 1,
+    system_prompt: str | None = None,
 ) -> list[SampleResult]:
     """Run inference and scoring over *rows*, processing *batch_size* samples per
     ``model.generate()`` call.
@@ -565,7 +566,7 @@ def validate(
 
         # -- Batched inference -------------------------------------------
         batch_images   = [it[3] for it in valid_items]
-        batch_prompts  = [_build_user_prompt(processor, it[1]) for it in valid_items]
+        batch_prompts  = [_build_user_prompt(processor, it[1], system_prompt=system_prompt) for it in valid_items]
 
         t0 = time.time()
         try:
@@ -744,6 +745,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--system-prompt-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a plain-text file whose content is prepended as a system "
+            "message for every sample during inference.  Should match the file "
+            "used during training.  Optional — if omitted no system turn is added."
+        ),
+    )
+    parser.add_argument(
         "--base-model-id",
         type=str,
         default=None,
@@ -830,6 +841,7 @@ def main() -> None:
     LOGGER.info("iou-threshold  : %s", args.iou_threshold)
     LOGGER.info("max-new-tokens : %s", args.max_new_tokens)
     LOGGER.info("coord-space    : %s", args.coord_space)
+    LOGGER.info("system-prompt  : %s", args.system_prompt_file or "(none)")
     LOGGER.info("img-size       : %s", args.img_size or "(processor default)")
     LOGGER.info("batch-size     : %d", args.batch_size)
     LOGGER.info("quantize       : %s", not args.no_quantize)
@@ -841,6 +853,18 @@ def main() -> None:
     (output_dir / "run_config.json").write_text(
         json.dumps(run_cfg, indent=2, default=str), encoding="utf-8"
     )
+
+    # Load optional system prompt
+    system_prompt: str | None = None
+    if args.system_prompt_file:
+        sp_path = Path(args.system_prompt_file)
+        if not sp_path.is_file():
+            raise FileNotFoundError(f"--system-prompt-file not found: {sp_path}")
+        system_prompt = sp_path.read_text(encoding="utf-8").strip() or None
+        if system_prompt is None:
+            LOGGER.warning("system_prompt_file '%s' is empty — no system turn will be added.", sp_path)
+        else:
+            LOGGER.info("System prompt loaded (%d chars): %s", len(system_prompt), system_prompt[:120])
 
     # Load data
     all_rows = _load_jsonl(args.eval_data)
@@ -871,6 +895,7 @@ def main() -> None:
         coord_space=args.coord_space,
         device=device,
         batch_size=args.batch_size,
+        system_prompt=system_prompt,
     )
     elapsed_total = time.time() - t_start
     LOGGER.info("Inference complete in %.1f s (%.2f s/sample).", elapsed_total, elapsed_total / max(len(results), 1))
