@@ -325,8 +325,19 @@ def _load_model_and_processor(
     # (e.g. a bare Trainer checkpoint), fall back to the base model.
     proc_source = model_dir
     if _is_peft_adapter(model_dir) and not (Path(model_dir) / "tokenizer_config.json").exists():
-        proc_source = base_model_id or _read_base_model_from_adapter(model_dir)
-        LOGGER.info("Processor not in adapter dir — loading from base model: %s", proc_source)
+        # Trainer checkpoint dirs (checkpoint-N/) don't get processor.save_pretrained().
+        # The final output_dir does.  Check the parent before falling back to the base
+        # model so image resolution settings from training are preserved.
+        parent_dir = Path(model_dir).parent
+        if (parent_dir / "tokenizer_config.json").exists():
+            proc_source = str(parent_dir)
+            LOGGER.info(
+                "Processor not in checkpoint dir — loading from parent output dir: %s",
+                proc_source,
+            )
+        else:
+            proc_source = base_model_id or _read_base_model_from_adapter(model_dir)
+            LOGGER.info("Processor not in adapter dir — loading from base model: %s", proc_source)
 
     processor = AutoProcessor.from_pretrained(proc_source, **processor_kwargs)
     if processor.tokenizer.pad_token_id is None:

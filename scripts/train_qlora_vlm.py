@@ -484,7 +484,7 @@ def main() -> None:
     processor = AutoProcessor.from_pretrained(
         str(cfg["model"]["model_id"]), trust_remote_code=True,
         min_pixels = cfg["model"]["input_width"] * cfg["model"]["input_height"],
-        max_pixel = cfg["model"]["input_width"] * cfg["model"]["input_height"]
+        max_pixels = cfg["model"]["input_width"] * cfg["model"]["input_height"]
     )
     tokenizer = processor.tokenizer
     if tokenizer.pad_token_id is None:
