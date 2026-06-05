@@ -411,6 +411,7 @@ def _run_inference_batch(
     prompt_texts: list[str],
     max_new_tokens: int,
     device: torch.device,
+    disable_thinking: bool = False,
 ) -> list[tuple[str, int]]:
     """Run one batched forward + generate pass.
 
@@ -443,8 +444,12 @@ def _run_inference_batch(
     padded_input_len = int(inputs["input_ids"].shape[-1])
     eos_id: int | None = processor.tokenizer.eos_token_id
 
+    gen_kwargs: dict[str, Any] = {"max_new_tokens": max_new_tokens}
+    if disable_thinking:
+        gen_kwargs["enable_thinking"] = False
+
     with torch.no_grad():
-        output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+        output_ids = model.generate(**inputs, **gen_kwargs)
 
     results: list[tuple[str, int]] = []
     for i in range(len(images)):
@@ -526,6 +531,7 @@ def validate(
     device: torch.device,
     batch_size: int = 1,
     system_prompt: str | None = None,
+    disable_thinking: bool = False,
 ) -> list[SampleResult]:
     """Run inference and scoring over *rows*, processing *batch_size* samples per
     ``model.generate()`` call.
@@ -583,6 +589,7 @@ def validate(
         try:
             batch_outputs = _run_inference_batch(
                 model, processor, batch_images, batch_prompts, max_new_tokens, device,
+                disable_thinking=disable_thinking,
             )
         except Exception as exc:
             LOGGER.error(
@@ -595,6 +602,7 @@ def validate(
                 try:
                     out = _run_inference_batch(
                         model, processor, [img_tensor], [prompt_text], max_new_tokens, device,
+                        disable_thinking=disable_thinking,
                     )
                     batch_outputs.append(out[0])
                 except Exception as exc2:
@@ -806,6 +814,15 @@ def parse_args() -> argparse.Namespace:
         help="Load model in full precision (bfloat16) instead of 4-bit NF4.",
     )
     parser.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        help=(
+            "Pass enable_thinking=False to model.generate(). Use with models that "
+            "support thinking/reasoning tokens (e.g. Qwen3) when you want clean "
+            "structured output without <think>...</think> blocks."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -856,6 +873,7 @@ def main() -> None:
     LOGGER.info("img-size       : %s", args.img_size or "(processor default)")
     LOGGER.info("batch-size     : %d", args.batch_size)
     LOGGER.info("quantize       : %s", not args.no_quantize)
+    LOGGER.info("disable-thinking: %s", args.disable_thinking)
 
     # Save run config for reproducibility
     run_cfg = vars(args).copy()
@@ -907,6 +925,7 @@ def main() -> None:
         device=device,
         batch_size=args.batch_size,
         system_prompt=system_prompt,
+        disable_thinking=args.disable_thinking,
     )
     elapsed_total = time.time() - t_start
     LOGGER.info("Inference complete in %.1f s (%.2f s/sample).", elapsed_total, elapsed_total / max(len(results), 1))

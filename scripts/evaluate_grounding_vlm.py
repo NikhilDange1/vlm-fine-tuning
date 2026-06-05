@@ -271,6 +271,7 @@ def evaluate_model_on_dataset(
     logger: Any = None,
     progress_every: int = 10,
     max_samples: int = 0,
+    disable_thinking: bool = False,
 ) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]]]:
     device = getattr(model, "device", None)
     if device is None:
@@ -282,6 +283,9 @@ def evaluate_model_on_dataset(
     model.eval()
     if logger:
         logger.info("Starting grounding generation eval for %d samples", total)
+    gen_kwargs: dict[str, Any] = {"max_new_tokens": max_new_tokens}
+    if disable_thinking:
+        gen_kwargs["enable_thinking"] = False
     for idx, row in enumerate(rows, start=1):
         image_path = _resolve_image_path(str(row["image"]), image_root=image_root)
         prompt = str(row.get("prompt", ""))
@@ -296,7 +300,7 @@ def evaluate_model_on_dataset(
                 inputs[key] = value.to(device)
 
         with torch.no_grad():
-            output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+            output_ids = model.generate(**inputs, **gen_kwargs)
 
         input_len = int(inputs["input_ids"].shape[-1])
         generated_ids = output_ids[0][input_len:]

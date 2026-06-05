@@ -53,6 +53,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-iou-threshold", type=float, default=None)
     parser.add_argument("--eval-max-new-tokens", type=int, default=None)
     parser.add_argument("--skip-final-eval", action="store_true")
+    parser.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        help=(
+            "Pass enable_thinking=False to model.generate() during eval. "
+            "Use with models that support thinking tokens (e.g. Qwen3)."
+        ),
+    )
 
     parser.add_argument("--log-level", type=str, default=None)
     parser.add_argument("--log-file", type=str, default=None)
@@ -117,6 +125,7 @@ def _default_config() -> dict[str, Any]:
             "eval_iou_threshold": 0.5,
             "eval_max_new_tokens": 512,
             "run_final_eval": True,
+            "disable_thinking": False,
         },
         "logging": {
             "log_level": "INFO",
@@ -190,6 +199,8 @@ def _apply_cli_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         _set_path(cfg, ("evaluation", "eval_subset_size"), args.eval_limit)
     if args.skip_final_eval:
         _set_path(cfg, ("evaluation", "run_final_eval"), False)
+    if args.disable_thinking:
+        _set_path(cfg, ("evaluation", "disable_thinking"), True)
 
 
 def _finalize_config(raw_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -333,6 +344,7 @@ class PeriodicGroundingEvalCallback(TrainerCallback):
         eval_max_new_tokens: int,
         eval_progress_every: int,
         logger: logging.Logger,
+        disable_thinking: bool = False,
     ) -> None:
         self.trainer = trainer
         self.processor = processor
@@ -345,6 +357,7 @@ class PeriodicGroundingEvalCallback(TrainerCallback):
         self.eval_max_new_tokens = eval_max_new_tokens
         self.eval_progress_every = eval_progress_every
         self.logger = logger
+        self.disable_thinking = disable_thinking
         self.history_path = Path(output_dir) / "eval_history.jsonl"
         self._running = False
 
@@ -386,6 +399,7 @@ class PeriodicGroundingEvalCallback(TrainerCallback):
                 max_new_tokens=self.eval_max_new_tokens,
                 logger=self.logger,
                 progress_every=self.eval_progress_every,
+                disable_thinking=self.disable_thinking,
             )
 
             log_payload = {
@@ -623,6 +637,7 @@ def main() -> None:
             eval_max_new_tokens=int(cfg["evaluation"]["eval_max_new_tokens"]),
             eval_progress_every=int(cfg["evaluation"]["eval_progress_every"]),
             logger=LOGGER,
+            disable_thinking=bool(cfg["evaluation"]["disable_thinking"]),
         )
         trainer.add_callback(callback)
 
@@ -654,6 +669,7 @@ def main() -> None:
             max_new_tokens=int(cfg["evaluation"]["eval_max_new_tokens"]),
             logger=LOGGER,
             progress_every=int(cfg["evaluation"]["eval_progress_every"]),
+            disable_thinking=bool(cfg["evaluation"]["disable_thinking"]),
         )
         metrics_path = Path(output_dir) / "eval_metrics.json"
         per_image_path = Path(output_dir) / "eval_per_image.jsonl"
