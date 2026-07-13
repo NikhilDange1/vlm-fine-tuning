@@ -239,6 +239,7 @@ def _build_user_prompt(
     processor: Any,
     prompt: str,
     system_prompt: str | None = None,
+    disable_thinking: bool = False,
 ) -> str:
     if hasattr(processor, "apply_chat_template"):
         messages: list[dict] = []
@@ -254,8 +255,14 @@ def _build_user_prompt(
                 {"type": "text", "text": prompt},
             ],
         })
+        template_kwargs: dict[str, Any] = {}
+        if disable_thinking:
+            # enable_thinking is a chat-template kwarg (Qwen3 convention),
+            # not a generation kwarg; templates without the variable simply
+            # ignore it.
+            template_kwargs["enable_thinking"] = False
         return processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True, **template_kwargs
         )
     prefix = f"System: {system_prompt}\n" if system_prompt else ""
     return f"{prefix}User: <image>\n{prompt}\nAssistant:"
@@ -272,6 +279,7 @@ def evaluate_model_on_dataset(
     progress_every: int = 10,
     max_samples: int = 0,
     disable_thinking: bool = False,
+    system_prompt: str | None = None,
 ) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]]]:
     device = getattr(model, "device", None)
     if device is None:
@@ -284,12 +292,15 @@ def evaluate_model_on_dataset(
     if logger:
         logger.info("Starting grounding generation eval for %d samples", total)
     gen_kwargs: dict[str, Any] = {"max_new_tokens": max_new_tokens}
-    if disable_thinking:
-        gen_kwargs["enable_thinking"] = False
     for idx, row in enumerate(rows, start=1):
         image_path = _resolve_image_path(str(row["image"]), image_root=image_root)
         prompt = str(row.get("prompt", ""))
-        prompt_text = _build_user_prompt(processor, prompt)
+        prompt_text = _build_user_prompt(
+            processor,
+            prompt,
+            system_prompt=system_prompt,
+            disable_thinking=disable_thinking,
+        )
 
         with Image.open(image_path) as img:
             rgb = img.convert("RGB")

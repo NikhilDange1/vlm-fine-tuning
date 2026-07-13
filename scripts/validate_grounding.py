@@ -411,7 +411,6 @@ def _run_inference_batch(
     prompt_texts: list[str],
     max_new_tokens: int,
     device: torch.device,
-    disable_thinking: bool = False,
 ) -> list[tuple[str, int]]:
     """Run one batched forward + generate pass.
 
@@ -444,12 +443,8 @@ def _run_inference_batch(
     padded_input_len = int(inputs["input_ids"].shape[-1])
     eos_id: int | None = processor.tokenizer.eos_token_id
 
-    gen_kwargs: dict[str, Any] = {"max_new_tokens": max_new_tokens}
-    if disable_thinking:
-        gen_kwargs["enable_thinking"] = False
-
     with torch.no_grad():
-        output_ids = model.generate(**inputs, **gen_kwargs)
+        output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
 
     results: list[tuple[str, int]] = []
     for i in range(len(images)):
@@ -583,13 +578,19 @@ def validate(
 
         # -- Batched inference -------------------------------------------
         batch_images   = [it[3] for it in valid_items]
-        batch_prompts  = [_build_user_prompt(processor, it[1], system_prompt=system_prompt) for it in valid_items]
+        batch_prompts  = [
+            _build_user_prompt(
+                processor, it[1],
+                system_prompt=system_prompt,
+                disable_thinking=disable_thinking,
+            )
+            for it in valid_items
+        ]
 
         t0 = time.time()
         try:
             batch_outputs = _run_inference_batch(
                 model, processor, batch_images, batch_prompts, max_new_tokens, device,
-                disable_thinking=disable_thinking,
             )
         except Exception as exc:
             LOGGER.error(
@@ -602,7 +603,6 @@ def validate(
                 try:
                     out = _run_inference_batch(
                         model, processor, [img_tensor], [prompt_text], max_new_tokens, device,
-                        disable_thinking=disable_thinking,
                     )
                     batch_outputs.append(out[0])
                 except Exception as exc2:
@@ -817,7 +817,7 @@ def parse_args() -> argparse.Namespace:
         "--disable-thinking",
         action="store_true",
         help=(
-            "Pass enable_thinking=False to model.generate(). Use with models that "
+            "Pass enable_thinking=False to the chat template. Use with models that "
             "support thinking/reasoning tokens (e.g. Qwen3) when you want clean "
             "structured output without <think>...</think> blocks."
         ),

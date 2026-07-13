@@ -21,26 +21,26 @@ Expected keys:
 - `prompt` (or `question` / `instruction`)
 - `response` (or `answer` / `output`)
 
-For grounding data the response should look like
+For grounding data the response is a JSON string in the wrapped `{"faults": [...]}` format (an empty list when the image has no objects):
 
 ```json
-{"image": "images/example1.jpg", 
-"prompt": "...", 
-"response": "[{\"class\": \"class_name\", \"bbox\": [x1, y1, x2, y2]}, {\"class\": \"class_name\", \"bbox\": [x1,y1,x2,y2]}]}"}
+{"image": "images/example1.jpg", "prompt": "...", "response": "{\"faults\": [{\"class\": \"class_name\", \"bbox\": [x1, y1, x2, y2]}, {\"class\": \"class_name\", \"bbox\": [x1, y1, x2, y2]}]}"}
 ```
+
+The legacy bare-array format (`"[{\"class\": ..., \"bbox\": ...}]"`) is still accepted by the parser for backward compatibility.
 
 ## 3) Run training
 
 Using config file:
 
 ```bash
-python scripts/train_qlora_vlm \
+python -m scripts.train_qlora_vlm \
   --config configs/train.example.yaml
 ```
 Using CLI:
 
 ```bash
-python scripts/train_qlora_vlm \
+python -m scripts.train_qlora_vlm \
   --model-id Qwen/Qwen2.5-VL-3B-Instruct \
   --train-data data/train.jsonl \
   --eval-data data/val.jsonl \

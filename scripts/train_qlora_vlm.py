@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         "--disable-thinking",
         action="store_true",
         help=(
-            "Pass enable_thinking=False to model.generate() during eval. "
+            "Pass enable_thinking=False to the chat template during eval. "
             "Use with models that support thinking tokens (e.g. Qwen3)."
         ),
     )
@@ -345,6 +345,7 @@ class PeriodicGroundingEvalCallback(TrainerCallback):
         eval_progress_every: int,
         logger: logging.Logger,
         disable_thinking: bool = False,
+        system_prompt: str | None = None,
     ) -> None:
         self.trainer = trainer
         self.processor = processor
@@ -358,6 +359,7 @@ class PeriodicGroundingEvalCallback(TrainerCallback):
         self.eval_progress_every = eval_progress_every
         self.logger = logger
         self.disable_thinking = disable_thinking
+        self.system_prompt = system_prompt
         self.history_path = Path(output_dir) / "eval_history.jsonl"
         self._running = False
 
@@ -400,6 +402,7 @@ class PeriodicGroundingEvalCallback(TrainerCallback):
                 logger=self.logger,
                 progress_every=self.eval_progress_every,
                 disable_thinking=self.disable_thinking,
+                system_prompt=self.system_prompt,
             )
 
             log_payload = {
@@ -542,16 +545,38 @@ def main() -> None:
     model.config.use_cache = False
     model.print_trainable_parameters()
 
-    # Pre-compute the token ids for the assistant turn start marker so we can
-    # mask the prompt from the training loss (only supervise the response).
-    # Qwen chat template uses "<|im_start|>assistant\n"; other processors may
-    # differ, so we try a few common patterns and fall back gracefully.
-    _assistant_marker_ids: list[int] | None = None
-    for _marker in ["<|im_start|>assistant\n", "<|im_start|>assistant", "assistant"]:
+    # Pre-compute token-id candidates for the assistant turn start marker so
+    # we can mask the prompt from the training loss (only supervise the
+    # response).  The primary candidate is derived from the chat template
+    # itself (the text appended for add_generation_prompt=True), which is
+    # anchored on special tokens and cannot occur inside ordinary prompt or
+    # response text.  Hardcoded Qwen-style markers are kept as fallbacks; a
+    # bare "assistant" string is deliberately NOT used because it can match
+    # the word "assistant" inside prompt/response text and mask the wrong
+    # span.
+    _assistant_marker_candidates: list[list[int]] = []
+    if hasattr(processor, "apply_chat_template"):
+        _probe = [{"role": "user", "content": [{"type": "text", "text": ""}]}]
+        try:
+            _without_gen = processor.apply_chat_template(
+                _probe, tokenize=False, add_generation_prompt=False
+            )
+            _with_gen = processor.apply_chat_template(
+                _probe, tokenize=False, add_generation_prompt=True
+            )
+            if _with_gen.startswith(_without_gen) and len(_with_gen) > len(_without_gen):
+                _ids = tokenizer.encode(
+                    _with_gen[len(_without_gen):], add_special_tokens=False
+                )
+                if _ids:
+                    _assistant_marker_candidates.append(_ids)
+        except Exception:
+            LOGGER.warning("Could not derive assistant marker from chat template.")
+    for _marker in ["<|im_start|>assistant\n", "<|im_start|>assistant"]:
         _ids = tokenizer.encode(_marker, add_special_tokens=False)
-        if _ids:
-            _assistant_marker_ids = _ids
-            break
+        if _ids and _ids not in _assistant_marker_candidates:
+            _assistant_marker_candidates.append(_ids)
+    _marker_miss_warned = [False]
 
     def collate_fn(rows: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         images = []
@@ -568,23 +593,40 @@ def main() -> None:
             padding=True,
         )
         labels = batch["input_ids"].clone()
-        # Mask padding tokens.
-        labels[labels == tokenizer.pad_token_id] = -100
+        # Mask padding via the attention mask, not the pad token id: when the
+        # tokenizer has no pad token we set pad_token = eos_token, and masking
+        # by id would also erase the real end-of-response EOS, so the model
+        # would never learn to stop generating.
+        attention_mask = batch.get("attention_mask")
+        if attention_mask is not None:
+            labels[attention_mask == 0] = -100
+        else:
+            labels[labels == tokenizer.pad_token_id] = -100
 
         # Mask prompt tokens so the loss is computed only on the assistant
         # response.  We locate the last occurrence of the assistant turn start
         # marker and mask everything up to (and including) it.
-        if _assistant_marker_ids:
-            marker_len = len(_assistant_marker_ids)
-            for i, seq in enumerate(batch["input_ids"].tolist()):
+        for i, seq in enumerate(batch["input_ids"].tolist()):
+            found_at = -1
+            marker_len = 0
+            for marker_ids in _assistant_marker_candidates:
+                mlen = len(marker_ids)
                 # Search from the end so we find the last (assistant) turn.
-                found_at = -1
-                for j in range(len(seq) - marker_len, -1, -1):
-                    if seq[j : j + marker_len] == _assistant_marker_ids:
+                for j in range(len(seq) - mlen, -1, -1):
+                    if seq[j : j + mlen] == marker_ids:
                         found_at = j
+                        marker_len = mlen
                         break
                 if found_at >= 0:
-                    labels[i, : found_at + marker_len] = -100
+                    break
+            if found_at >= 0:
+                labels[i, : found_at + marker_len] = -100
+            elif not _marker_miss_warned[0]:
+                _marker_miss_warned[0] = True
+                LOGGER.warning(
+                    "Assistant turn marker not found in a training sequence; "
+                    "loss will include prompt tokens for such samples."
+                )
 
         batch["labels"] = labels
         return batch
@@ -638,6 +680,7 @@ def main() -> None:
             eval_progress_every=int(cfg["evaluation"]["eval_progress_every"]),
             logger=LOGGER,
             disable_thinking=bool(cfg["evaluation"]["disable_thinking"]),
+            system_prompt=system_prompt,
         )
         trainer.add_callback(callback)
 
@@ -670,6 +713,7 @@ def main() -> None:
             logger=LOGGER,
             progress_every=int(cfg["evaluation"]["eval_progress_every"]),
             disable_thinking=bool(cfg["evaluation"]["disable_thinking"]),
+            system_prompt=system_prompt,
         )
         metrics_path = Path(output_dir) / "eval_metrics.json"
         per_image_path = Path(output_dir) / "eval_per_image.jsonl"

@@ -19,13 +19,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Any
 
 import torch
 from PIL import Image
-from transformers import AutoModelForImageTextToText, AutoProcessor
 
 # Allow running from repo root without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -35,6 +35,7 @@ from scripts.evaluate_grounding_vlm import (
     bbox_iou,
     parse_grounding_response,
 )
+from scripts.validate_grounding import _load_model_and_processor
 
 SEP = "-" * 72
 
@@ -83,27 +84,55 @@ def main() -> None:
     parser.add_argument("--num-samples", type=int, default=5, help="Number of samples to inspect.")
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Max tokens for generation.")
     parser.add_argument("--iou-threshold", type=float, default=0.5, help="IoU threshold for matching.")
-    parser.add_argument("--img-size",type=int,default=896,help="Input images size")
+    parser.add_argument("--img-size", type=int, default=896, help="Force processor image resolution to img_size x img_size.")
+    parser.add_argument(
+        "--base-model-id",
+        type=str,
+        default=None,
+        help="Base HuggingFace model ID when --model-dir is a PEFT adapter (auto-read from adapter_config.json if omitted).",
+    )
+    parser.add_argument(
+        "--no-quantize",
+        action="store_true",
+        help="Load model in full precision (bfloat16) instead of 4-bit NF4.",
+    )
+    parser.add_argument(
+        "--system-prompt-file",
+        type=str,
+        default=None,
+        help="Plain-text file prepended as a system message for every sample. Should match the file used during training.",
+    )
+    parser.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        help="Pass enable_thinking=False to the chat template (Qwen3-style thinking models).",
+    )
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 
     print(SEP)
     print("VLM GROUNDING EVAL DIAGNOSTIC")
     print(SEP)
 
-    # Load processor and model
-    print(f"\nLoading processor from: {args.model_dir}")
-    processor = AutoProcessor.from_pretrained(str(args.model_dir), trust_remote_code=True,
-                                              min_pixels = int(args.img_size)**2)
-    print(f"Loading model from: {args.model_dir}")
+    # Load processor and model through the same loader as validate_grounding
+    # so PEFT adapter checkpoints and the training image resolution
+    # (min_pixels AND max_pixels) are handled identically to the real pipeline.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AutoModelForImageTextToText.from_pretrained(
-        str(args.model_dir),
-        device_map="auto",
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
+    model, processor = _load_model_and_processor(
+        model_dir=str(args.model_dir),
+        quantize=not args.no_quantize,
+        device=device,
+        img_size=args.img_size,
+        base_model_id=args.base_model_id,
     )
-    model.eval()
     print(f"Model loaded on device: {device}\n")
+
+    system_prompt: str | None = None
+    if args.system_prompt_file:
+        system_prompt = Path(args.system_prompt_file).read_text(encoding="utf-8").strip() or None
+        if system_prompt:
+            print(f"System prompt loaded ({len(system_prompt)} chars): {system_prompt[:120]}\n")
 
     # Load eval rows
     rows = load_jsonl(args.eval_data)
@@ -123,7 +152,12 @@ def main() -> None:
         with Image.open(image_path) as img:
             img_w, img_h = img.size
             rgb = img.convert("RGB")
-            prompt_text = _build_user_prompt(processor, prompt)
+            prompt_text = _build_user_prompt(
+                processor,
+                prompt,
+                system_prompt=system_prompt,
+                disable_thinking=args.disable_thinking,
+            )
             inputs = processor(images=rgb, text=prompt_text, return_tensors="pt")
 
         for key, value in list(inputs.items()):
@@ -213,7 +247,7 @@ def main() -> None:
                     if iou > best_iou:
                         best_iou = iou
                         best_pi = pi
-                match = best_idx_matched = False
+                match = False
                 if best_pi >= 0 and best_iou >= args.iou_threshold:
                     matched.add(best_pi)
                     tp += 1
